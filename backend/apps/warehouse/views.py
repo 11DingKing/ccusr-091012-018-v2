@@ -4,6 +4,7 @@
 import logging
 import io
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -15,7 +16,7 @@ from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer, StockInSerializer, StockInCreateSerializer, StockOutSerializer,
     WarningSerializer, ApprovalSerializer
 )
 
@@ -589,14 +590,124 @@ class GoodsListView(APIView):
 class StockInListView(APIView):
     """入库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.all().order_by('-stock_in_time')
+
+        risk_level = request.query_params.get('risk_level')
+        if risk_level:
+            queryset = queryset.filter(risk_level=risk_level)
+        status_param = request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        records = queryset[start:end]
+
+        serializer = StockInSerializer(records, many=True)
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        """收件登记：高风险收件登记后进入待审批，普通收件直接通过"""
+        serializer = StockInCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        goods = Goods.objects.get(pk=data['goods'])
+        risk_level = data.get('risk_level', 'normal')
+        stock_in = StockIn.objects.create(
+            goods=goods,
+            operator=request.user,
+            quantity=data['quantity'],
+            batch_no=data.get('batch_no', ''),
+            supplier=data.get('supplier', ''),
+            risk_level=risk_level,
+            status='pending' if risk_level == 'high' else 'approved',
+            remark=data.get('remark', ''),
+        )
+
+        logger.info(
+            f"User {request.user.username} registered stock-in {stock_in.id} "
+            f"goods={goods.name} risk={risk_level}"
+        )
+
+        message = '登记成功，高风险收件待审批' if risk_level == 'high' else '登记成功'
+        return success_response(data=StockInSerializer(stock_in).data, message=message)
+
+
+class StockInApproveView(APIView):
+    """高风险收件审批视图
+
+    审批人必须持有"高风险收件审批"权限（含临时代理获得），
+    且不得与收件存在职责冲突（如本人创建了该收件所属移交单位），
+    冲突判定结果一律留痕。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        from apps.sod.engine import check_business_action, get_effective_permissions
+
+        try:
+            stock_in = StockIn.objects.select_related(
+                'goods__variety__category__unit__created_by', 'operator'
+            ).get(pk=pk)
+        except StockIn.DoesNotExist:
+            return error_response(message='收件记录不存在', code=404)
+
+        if stock_in.risk_level != 'high':
+            return error_response(message='仅高风险收件需要审批')
+        if stock_in.status != 'pending':
+            return error_response(message='该收件已审批，请勿重复操作')
+
+        # 权限检查：必须持有高风险收件审批权限（临时代理获得的权限同样有效）
+        effective = get_effective_permissions(request.user)
+        if 'stock_in:approve_high_risk' not in effective:
+            return error_response(message='无高风险收件审批权限', code=403)
+
+        decision = request.data.get('decision')
+        if decision not in ['approve', 'reject']:
+            return error_response(message='请选择审批结果（approve/reject）')
+        remark = request.data.get('remark', '')
+
+        if decision == 'approve':
+            # 职责冲突检查：创建人（含其临时代理人）不得批准自己的对象，
+            # 冲突时抛出 PermissionException 由全局异常处理器返回 403
+            check_business_action(
+                request.user, 'stock_in:approve_high_risk', stock_in,
+                'stock_in', object_label=str(stock_in)
+            )
+            stock_in.status = 'approved'
+        else:
+            stock_in.status = 'rejected'
+
+        stock_in.approved_by = request.user
+        stock_in.approved_at = timezone.now()
+        if remark:
+            stock_in.remark = f"{stock_in.remark}\n审批意见：{remark}".strip()
+        stock_in.save()
+
+        logger.info(
+            f"User {request.user.username} {decision}d high-risk stock-in {stock_in.id}"
+        )
+
+        return success_response(
+            data=StockInSerializer(stock_in).data,
+            message='审批通过' if decision == 'approve' else '已拒绝'
+        )
 
 
 class StockOutListView(APIView):

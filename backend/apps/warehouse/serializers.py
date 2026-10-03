@@ -152,13 +152,43 @@ class StockInSerializer(serializers.ModelSerializer):
     """入库记录序列化器"""
     goods_name = serializers.CharField(source='goods.name', read_only=True)
     operator_name = serializers.CharField(source='operator.username', read_only=True)
-    
+    risk_level_display = serializers.CharField(source='get_risk_level_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    approved_by_name = serializers.CharField(source='approved_by.username', read_only=True)
+
     class Meta:
         model = StockIn
         fields = [
             'id', 'goods', 'goods_name', 'operator', 'operator_name',
-            'quantity', 'batch_no', 'supplier', 'stock_in_time', 'remark'
+            'quantity', 'batch_no', 'supplier',
+            'risk_level', 'risk_level_display', 'status', 'status_display',
+            'approved_by', 'approved_by_name', 'approved_at',
+            'stock_in_time', 'remark'
         ]
+
+
+class StockInCreateSerializer(serializers.Serializer):
+    """收件登记序列化器"""
+    goods = serializers.IntegerField(required=True, error_messages={
+        'required': '请选择货物',
+    })
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2, required=True, error_messages={
+        'required': '请输入入库数量',
+    })
+    batch_no = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    supplier = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    risk_level = serializers.ChoiceField(choices=['normal', 'high'], default='normal')
+    remark = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_goods(self, value):
+        if not Goods.objects.filter(pk=value, is_active=True).exists():
+            raise serializers.ValidationError('货物不存在或已停用')
+        return value
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('入库数量必须大于0')
+        return value
 
 
 class StockOutSerializer(serializers.ModelSerializer):
