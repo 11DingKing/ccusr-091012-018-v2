@@ -7,7 +7,7 @@ from .views import (
     CategoryListView, CategoryDetailView, CategoryBatchDeleteView, CategoryAllView,
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
-    DashboardView, GoodsListView, StockInListView, StockOutListView,
+    DashboardView, GoodsListView, StockInListView, StockInApproveView, StockOutListView,
     WarningListView, ApprovalListView
 )
 
@@ -39,6 +39,7 @@ urlpatterns = [
     
     # 入库管理
     path('stock-in/', StockInListView.as_view(), name='stock-in-list'),
+    path('stock-in/<int:pk>/approve/', StockInApproveView.as_view(), name='stock-in-approve'),
     
     # 出库管理
     path('stock-out/', StockOutListView.as_view(), name='stock-out-list'),

@@ -131,6 +131,12 @@ class Goods(models.Model):
 
 class StockIn(models.Model):
     """入库记录模型"""
+    STATUS_CHOICES = [
+        ('pending', '待审批'),
+        ('approved', '已通过'),
+        ('rejected', '已拒绝'),
+    ]
+
     goods = models.ForeignKey(
         Goods, on_delete=models.CASCADE,
         related_name='stock_ins', verbose_name='货物'
@@ -142,6 +148,13 @@ class StockIn(models.Model):
     quantity = models.DecimalField('入库数量', max_digits=12, decimal_places=2)
     batch_no = models.CharField('批次号', max_length=50, blank=True)
     supplier = models.CharField('供应商', max_length=200, blank=True)
+    is_high_risk = models.BooleanField('高风险收件', default=False)
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
+    approved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_receipts', verbose_name='审批人'
+    )
+    approved_at = models.DateTimeField('审批时间', null=True, blank=True)
     stock_in_time = models.DateTimeField('入库时间', auto_now_add=True)
     remark = models.TextField('备注', blank=True)
     

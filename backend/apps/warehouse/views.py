@@ -4,18 +4,20 @@
 import logging
 import io
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
+from apps.sod import services as sod_services
 from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer, StockInSerializer, StockInCreateSerializer, StockOutSerializer,
     WarningSerializer, ApprovalSerializer
 )
 
@@ -589,14 +591,108 @@ class GoodsListView(APIView):
 class StockInListView(APIView):
     """入库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.select_related(
+            'goods', 'operator', 'approved_by'
+        ).order_by('-stock_in_time')
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        records = queryset[start:end]
+
+        serializer = StockInSerializer(records, many=True)
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        """收件登记：登记后进入待审批状态，批准后入账"""
+        serializer = StockInCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        receipt = StockIn.objects.create(
+            goods_id=data['goods'],
+            operator=request.user,
+            quantity=data['quantity'],
+            batch_no=data.get('batch_no', ''),
+            supplier=data.get('supplier', ''),
+            is_high_risk=data.get('is_high_risk', False),
+            remark=data.get('remark', ''),
+        )
+
+        logger.info(
+            f"User {request.user.username} registered receipt {receipt.id} "
+            f"for goods {receipt.goods_id} (high_risk={receipt.is_high_risk})"
+        )
+
+        return success_response(data=StockInSerializer(receipt).data, message='登记成功')
+
+
+class StockInApproveView(APIView):
+    """
+    收件审批。高风险收件要求审批人持有高风险审批权限（角色或生效代理），
+    并经过职责冲突引擎判断：创建人（登记人/移交单位创建人）不得审批自己的对象，
+    紧急豁免放行与阻断都会留下判断依据。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            receipt = StockIn.objects.select_related(
+                'goods__variety__category__unit', 'operator'
+            ).get(pk=pk)
+        except StockIn.DoesNotExist:
+            return error_response(message='收件记录不存在', code=404)
+
+        if receipt.status != 'pending':
+            return error_response(message='该收件已审批，请勿重复操作')
+
+        if receipt.is_high_risk:
+            # 高风险收件：审批人必须持有高风险审批权限（角色或生效中的临时代理）
+            perms, _ = sod_services.get_effective_permissions(request.user)
+            if sod_services.HIGH_RISK_APPROVE_PERMISSION not in perms:
+                return error_response(message='缺少高风险收件审批权限', code=403)
+
+            # 职责冲突：创建人不得审批自己的对象（临时代理与紧急豁免已纳入判断）
+            verdict = sod_services.evaluate_self_approval(request.user, 'stock_in', receipt)
+            if not verdict['allowed']:
+                return error_response(message=verdict['basis'], code=403, data={
+                    'rule_id': verdict['rule'].id if verdict['rule'] else None,
+                    'rule_name': verdict['rule'].name if verdict['rule'] else '',
+                    'relations': verdict['relations'],
+                })
+
+        receipt.status = 'approved'
+        receipt.approved_by = request.user
+        receipt.approved_at = timezone.now()
+        receipt.save(update_fields=['status', 'approved_by', 'approved_at'])
+
+        # 批准后入账
+        goods = receipt.goods
+        goods.quantity = goods.quantity + receipt.quantity
+        goods.save(update_fields=['quantity', 'updated_at'])
+
+        logger.info(
+            f"User {request.user.username} approved receipt {receipt.id} "
+            f"(high_risk={receipt.is_high_risk})"
+        )
+
+        return success_response(data=StockInSerializer(receipt).data, message='审批通过')
 
 
 class StockOutListView(APIView):
